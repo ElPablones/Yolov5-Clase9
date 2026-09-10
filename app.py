@@ -1,13 +1,16 @@
-from PIL import Image
-import io
 import streamlit as st
 import numpy as np
 import pandas as pd
-import torch
+import time
+from PIL import Image
+import io
+import cv2
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+import av
 
 st.set_page_config(
-    page_title="Detección de Objetos en Tiempo Real",
-    page_icon="🔍",
+    page_title="Evaluación YOLOv5",
+    page_icon="🔬",
     layout="wide"
 )
 
@@ -21,87 +24,139 @@ def load_model():
         st.error(f"❌ Error al cargar el modelo: {str(e)}")
         return None
 
-st.title("🔍 Detección de Objetos en Imágenes")
-st.markdown("Esta aplicación utiliza YOLOv5 para detectar objetos en imágenes capturadas con tu cámara.")
+st.title("🔬 Herramienta de Evaluación YOLOv5")
+st.markdown("Prueba la precisión, velocidad y comportamiento del modelo en diferentes escenarios.")
 
 with st.spinner("Cargando modelo YOLOv5..."):
     model = load_model()
 
 if model:
     with st.sidebar:
-        st.title("Parámetros")
-        st.subheader("Configuración de detección")
+        st.title("⚙️ Parámetros de Inferencia")
         conf_threshold = st.slider("Confianza mínima", 0.0, 1.0, 0.25, 0.01)
-        iou_threshold  = st.slider("Umbral IoU", 0.0, 1.0, 0.45, 0.01)
-        max_det        = st.number_input("Detecciones máximas", 10, 2000, 1000, 10)
-
-    picture = st.camera_input("Capturar imagen", key="camera")
-
-    if picture:
-        bytes_data = picture.getvalue()
-
-        # Decodificar con Pillow en lugar de cv2 (evita dependencia libGL)
-        #pil_img  = Image.open(io.BytesIO(bytes_data)).convert("RGB")
-        #np_img   = np.array(pil_img)   # array RGB
-
-        pil_img = Image.open(io.BytesIO(bytes_data)).convert("RGB")
-        np_img  = np.array(pil_img)[..., ::-1]  # RGB → BGR para que YOLO procese bien
-
+        iou_threshold  = st.slider("Umbral IoU (Solapamiento)", 0.0, 1.0, 0.45, 0.01)
         
-        with st.spinner("Detectando objetos..."):
-            try:
-                results = model(
-                    np_img,
-                    conf=conf_threshold,
-                    iou=iou_threshold,
-                    max_det=int(max_det)
-                )
-            except Exception as e:
-                st.error(f"Error durante la detección: {str(e)}")
-                st.stop()
+        st.divider()
+        st.subheader("Modo de Entrada")
+        input_mode = st.radio(
+            "Selecciona la fuente:", 
+            ["📷 Foto (Cámara)", "📁 Subir Archivo", "🎥 Video en Vivo (WebRTC)"]
+        )
 
-        result    = results[0]
-        boxes     = result.boxes
-        annotated = result.plot()              # devuelve BGR numpy array
-        annotated_rgb = annotated[:, :, ::-1]  # BGR → RGB sin cv2
+    # --- LÓGICA DE PROCESAMIENTO ESTÁTICO (FOTOS / ARCHIVOS) ---
+    def process_static_image(image_bytes):
+        pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        np_img  = np.array(pil_img)[..., ::-1] # RGB a BGR para OpenCV/YOLO
+        img_h, img_w, _ = np_img.shape
 
-        col1, col2 = st.columns(2)
+        start_time = time.time()
+        results = model(np_img, conf=conf_threshold, iou=iou_threshold)
+        inference_time = (time.time() - start_time) * 1000 # milisegundos
 
-        with col1:
-            st.subheader("Imagen con detecciones")
-            st.image(annotated_rgb, use_container_width=True)
+        result = results[0]
+        boxes = result.boxes
+        annotated_bgr = result.plot()
+        annotated_rgb = annotated_bgr[:, :, ::-1]
 
-        with col2:
-            st.subheader("Objetos detectados")
+        # Interfaz de resultados
+        st.subheader(f"⏱️ Tiempo de inferencia: {inference_time:.1f} ms")
+        
+        col_img, col_data = st.columns([3, 2])
+        with col_img:
+            st.image(annotated_rgb, caption="Resultado de la detección", use_container_width=True)
+
+        with col_data:
             if boxes is not None and len(boxes) > 0:
-                label_names    = model.names
-                category_count = {}
-                category_conf  = {}
+                st.write("**Mapeo Espacial de Objetos**")
+                
+                spatial_data = []
+                crops = []
 
                 for box in boxes:
-                    cat  = int(box.cls.item())
+                    cat = int(box.cls.item())
                     conf = float(box.conf.item())
-                    category_count[cat] = category_count.get(cat, 0) + 1
-                    category_conf.setdefault(cat, []).append(conf)
+                    label = model.names[cat]
+                    
+                    # Coordenadas (x1, y1, x2, y2)
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    
+                    # Calcular centroide para ubicarlo en el espacio (Izquierda, Centro, Derecha)
+                    x_center = (x1 + x2) / 2
+                    if x_center < img_w / 3:
+                        ubicacion = "Izquierda"
+                    elif x_center > (img_w / 3) * 2:
+                        ubicacion = "Derecha"
+                    else:
+                        ubicacion = "Centro"
 
-                data = [
-                    {
-                        "Categoría":          label_names[cat],
-                        "Cantidad":           count,
-                        "Confianza promedio": f"{np.mean(category_conf[cat]):.2f}"
-                    }
-                    for cat, count in category_count.items()
-                ]
+                    spatial_data.append({
+                        "Objeto": label,
+                        "Confianza": f"{conf:.2f}",
+                        "Ubicación": ubicacion
+                    })
 
-                df = pd.DataFrame(data)
-                st.dataframe(df, use_container_width=True)
-                st.bar_chart(df.set_index("Categoría")["Cantidad"])
+                    # Extraer el recorte (Cropping)
+                    crop_img = annotated_rgb[y1:y2, x1:x2]
+                    crops.append((label, crop_img))
+
+                # Mostrar tabla de datos espaciales
+                st.dataframe(pd.DataFrame(spatial_data), use_container_width=True)
+                
+                # Galería dinámica de recortes
+                st.write("**Objetos Extraídos (Cropping)**")
+                crop_cols = st.columns(min(len(crops), 4) if len(crops) > 0 else 1)
+                for i, (label, crop) in enumerate(crops):
+                    if i < 8: # Limitar a 8 recortes para no saturar la UI
+                        with crop_cols[i % 4]:
+                            st.image(crop, caption=label, use_container_width=True)
             else:
                 st.info("No se detectaron objetos con los parámetros actuales.")
-                st.caption("Prueba a reducir el umbral de confianza en la barra lateral.")
-else:
-    st.error("No se pudo cargar el modelo. Verifica las dependencias e inténtalo nuevamente.")
-    st.stop()
 
-st.markdown("---")
-st.caption("**Acerca de la aplicación**: Detección de objetos con YOLOv5 + Streamlit + PyTorch.")
+    # --- RUTAS DE ENTRADA ---
+    if input_mode == "📷 Foto (Cámara)":
+        picture = st.camera_input("Capturar imagen para analizar")
+        if picture:
+            process_static_image(picture.getvalue())
+
+    elif input_mode == "📁 Subir Archivo":
+        uploaded_file = st.file_uploader("Sube una imagen", type=["jpg", "jpeg", "png"])
+        if uploaded_file:
+            process_static_image(uploaded_file.getvalue())
+
+    elif input_mode == "🎥 Video en Vivo (WebRTC)":
+        st.info("El video en vivo procesa cuadro por cuadro. Ajusta los parámetros en la barra lateral para ver cómo cambia el rendimiento.")
+        
+        def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+            img = frame.to_ndarray(format="bgr24")
+            
+            # Medir FPS e Inferencia internamente
+            start_t = time.time()
+            results = model(img, conf=conf_threshold, iou=iou_threshold)
+            inf_time_ms = (time.time() - start_t) * 1000
+            
+            annotated_img = results[0].plot()
+            
+            # Dibujar telemetría directamente en el video
+            cv2.putText(
+                annotated_img, 
+                f"Inferencia: {inf_time_ms:.1f} ms", 
+                (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 
+                1, 
+                (0, 255, 0), 
+                2
+            )
+
+            return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
+
+        webrtc_streamer(
+            key="yolo-eval",
+            mode=WebRtcMode.SENDRECV,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True
+        )
+
+else:
+    st.error("No se pudo cargar el modelo.")
+    st.stop()
